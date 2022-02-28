@@ -1,0 +1,136 @@
+- name: GitLab Runner to Debian
+  hosts: runners
+  become: yes
+  become_method: sudo
+  tasks:
+  - include_vars: "./{{ domain }}_vars.yml"
+  - name: Install dependency
+    apt:
+      name:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg
+        - lsb-release
+        - debian-archive-keyring
+        - openssh-server
+        - ca-certificates
+        - tzdata
+        - perl
+      state: present
+      update_cache: yes
+
+  - name: Add GPG Gitlab key
+    apt_key:
+      url: https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+      state: present
+
+  - name: Add repository to apt
+    apt_repository:
+      repo: deb https://packages.gitlab.com/runner/gitlab-runner/debian/ {{ ansible_distribution_release }} main
+      state: present
+
+  - name: Add src repository to apt
+    apt_repository:
+      repo: deb-src https://packages.gitlab.com/runner/gitlab-runner/debian/ {{ ansible_distribution_release }} main
+      state: present
+
+  - name: Install GitLab
+    apt:
+      name:
+        - gitlab-runner
+        - python3-gitlab
+      state: present
+      update_cache: yes
+
+  - name: add DNS
+    lineinfile:
+      dest: /etc/resolv.conf
+      line: "nameserver 10.150.0.1"
+      insertbefore: BOF
+      state: present
+    register: dns
+
+  - name: Restart systemd-resolved
+    service:
+      name: systemd-resolved
+      state: restarted
+    when: dns.changed
+
+  - name: Delete old versions
+    apt:
+      name:
+        - docker
+        - docker-engine
+        - docker.io
+        - containerd
+        - runc
+      state: absent
+
+  - name: Add GPG Docker key
+    apt_key:
+      url: https://download.docker.com/linux/debian/gpg
+      state: present
+
+  - name: Add docker repository to apt
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable
+      state: present
+
+  - name: Install docker
+    apt:
+      name:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+      state: latest
+      update_cache: yes
+
+  - name: Deploy Docker daemon.json
+    copy:
+      src: ./daemon.json
+      dest: /etc/docker/daemon.json
+    register: docker_daemon
+
+  - name: Restart Docker
+    service:
+      name: docker
+      state: restarted
+    when: docker_daemon.changed
+
+  - name: Install CA
+    copy:
+      src: ./timepathCA.crt
+      dest: /usr/local/share/ca-certificates/timepathCA.crt
+    register: ca
+
+  - name: Debian CA Fresh
+    shell: /usr/sbin/update-ca-certificates
+    when: ca.changed
+
+  - name: "Register runner"
+    community.general.gitlab_runner:
+      api_url: "https://{{ domain }}/"
+      api_token: "{{ gitlab_api_token }}"
+      registration_token: "{{ runner_registration_token }}"
+      description: "{{ ansible_hostname  }}: docker"
+      state: present
+      active: True
+      tag_list: ['docker']
+      run_untagged: True
+      locked: False
+    register: gitlab_runner_registration
+
+  - name: create gitlab-runner configuration file
+    template:
+      src: ./runner_config.toml.j2
+      dest: /etc/gitlab-runner/config.toml
+      owner: root
+      group: root
+      mode: '0600'
+    when: gitlab_runner_registration.runner.token is defined
+    register: runner_config
+
+  - name: Restart Runner
+    shell: /usr/bin/gitlab-runner restart
+    when: runner_config.changed
